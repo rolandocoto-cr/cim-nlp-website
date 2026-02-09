@@ -4,7 +4,18 @@ import threading
 from streamlit_option_menu import option_menu
 
 st.set_page_config(page_title="Cook Islands Māori NLP")
-ASR_URL = "https://asr-service-790340752928.us-central1.run.app/transcribe"
+
+# ── Initialize TTS session state ─────────────────────────────────────────────
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
+if 'audio_bytes' not in st.session_state:
+    st.session_state.audio_bytes = None
+if 'error_message' not in st.session_state:
+    st.session_state.error_message = None
+if 'user_text' not in st.session_state:
+    st.session_state.user_text = "Kia orana kōtou kātoatoa"
+if 'input_key' not in st.session_state:
+    st.session_state.input_key = 0
 
 # ── Top navigation menu ─────────────────────────────────────────────────────
 page = option_menu(
@@ -26,7 +37,7 @@ page = option_menu(
 if page == "Home":
     st.title("🏠 Kia Orana! Welcome")
     st.write(
-        "Welcome to the CIM NLP platform."
+        "Welcome to the CIM NLP platform. "
         "Use the menu above to navigate between tools."
     )
 
@@ -44,7 +55,7 @@ elif page == "Transcription":
         def send_request():
             try:
                 requests.post(
-                    ASR_URL,
+                    st.secrets["ASR_URL"],
                     files={"file": (file_name, file_content, "audio/wav")},
                     data={"email": user_email},
                     timeout=3600,
@@ -91,20 +102,90 @@ elif page == "Transcription":
 
 # ── Voice Generation page ───────────────────────────────────────────────────
 elif page == "Voice Generation":
-    st.title("🔊 Voice Generation")
-    st.write("This feature is coming soon.")
+    st.title("🔊 Cook Islands Māori TTS")
+
+    # Callbacks for special character buttons
+    def add_char(char):
+        st.session_state.user_text = st.session_state.user_text + char
+        st.session_state.input_key += 1
+
+    def on_text_change():
+        st.session_state.user_text = st.session_state[f"text_input_{st.session_state.input_key}"]
+
+    # Text input with dynamic key
+    st.text_input(
+        "Enter your text:",
+        value=st.session_state.user_text,
+        key=f"text_input_{st.session_state.input_key}",
+        on_change=on_text_change
+    )
+
+    # Special character buttons
+    st.caption("Insert special characters:")
+    special_chars = ['ā', 'ē', 'ī', 'ō', 'ū', 'ꞌ']
+    cols = st.columns(len(special_chars))
+    for idx, char in enumerate(special_chars):
+        with cols[idx]:
+            st.button(char, key=f"btn_char_{idx}", use_container_width=True,
+                      on_click=add_char, args=(char,))
+
+    st.write("")
+
+    # Generate button
+    button_text = "Please wait..." if st.session_state.processing else "Generate audio"
+    button_clicked = st.button(button_text, disabled=st.session_state.processing)
+
+    if button_clicked:
+        st.session_state.audio_bytes = None
+        st.session_state.error_message = None
+        st.session_state.processing = True
+        st.rerun()
+
+    if st.session_state.processing:
+        try:
+            api_url = st.secrets["TTS_URL"]
+
+            response = requests.post(
+                api_url,
+                json={"text": st.session_state.user_text},
+                timeout=60
+            )
+
+            if response.ok:
+                st.session_state.audio_bytes = response.content
+            else:
+                st.session_state.error_message = (
+                    f"HTTP Error {response.status_code}: {response.reason}\n"
+                    f"Response body: {response.text}"
+                )
+        except requests.exceptions.ConnectionError as e:
+            st.session_state.error_message = f"Connection error: {e}"
+        except requests.exceptions.Timeout as e:
+            st.session_state.error_message = f"Request timed out: {e}"
+        except Exception as e:
+            st.session_state.error_message = f"Unexpected error: {type(e).__name__}: {e}"
+        finally:
+            st.session_state.processing = False
+            st.rerun()
+
+    # Display results
+    if st.session_state.audio_bytes:
+        st.success("Audio generated!")
+        st.audio(st.session_state.audio_bytes, format='audio/wav')
+        st.download_button(
+            label="Download WAV",
+            data=st.session_state.audio_bytes,
+            file_name="output.wav",
+            mime="audio/wav"
+        )
+
+    if st.session_state.error_message:
+        st.error(st.session_state.error_message)
 
 # ── Parsing page ─────────────────────────────────────────────────────────────
 elif page == "Parsing":
     st.title("📄 Parsing")
     st.write("This feature is coming soon.")
-
-# ── About page ───────────────────────────────────────────────────────────────
-elif page == "About":
-    st.title("About the Project")
-    st.markdown("The speech recognition (transcription) uses an [Wav2Vec2-XLSR](https://huggingface.co/docs/transformers/en/model_doc/xlsr_wav2vec2) model that transforms an audio recording in Cook Islands Māori into a text transcription of the words in the recording.")
-    st.markdown("The model was developed by Rolando Coto-Solano, Sally Akevai Nicholas, and students from Dartmouth College. You can read more about the project here: [Development of Automatic Speech Recognition for the Documentation of Cook Islands Māori](https://aclanthology.org/2022.lrec-1.412).")
-    st.write("This is part of a larger project by Sally Akevai Nicholas to document the Cook Islands Māori language.")
 
 # ── Spell Checking page ─────────────────────────────────────────────────────
 elif page == "Spell Checking":
@@ -115,3 +196,12 @@ elif page == "Spell Checking":
 elif page == "Forced Alignment":
     st.title("🔊 Forced Alignment")
     st.write("This feature is coming soon.")
+
+# ── About page ───────────────────────────────────────────────────────────────
+elif page == "About":
+    st.title("About the Project")
+    st.markdown("The speech recognition (transcription) uses a [Wav2Vec2-XLSR](https://huggingface.co/docs/transformers/en/model_doc/xlsr_wav2vec2) model that transforms an audio recording in Cook Islands Māori into a text transcription of the words in the recording.")
+    st.markdown("The model was developed by Rolando Coto-Solano, Sally Akevai Nicholas, and students from Dartmouth College. You can read more about the project here: [Development of Automatic Speech Recognition for the Documentation of Cook Islands Māori](https://aclanthology.org/2022.lrec-1.412).")
+    st.markdown("The text-to-speech (voice generation) uses a [FastSpeech2](https://arxiv.org/abs/2006.04558) model that transforms text in Cook Islands Māori into a synthetically generated voice recording.")
+    st.markdown("The model was developed by Jesyn James, Sally Akevai Nicholas, Rolando Coto-Solano, and students from University of Auckland. You can read more about the project here: [Development of Community-Oriented Text-to-Speech Models for Māori ꞌAvaiki Nui (Cook Islands Māori)](https://aclanthology.org/2024.lrec-main.432/)")
+    st.write("This is part of a larger project by Sally Akevai Nicholas to document the Cook Islands Māori language.")
