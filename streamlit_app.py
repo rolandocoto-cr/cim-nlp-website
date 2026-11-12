@@ -50,7 +50,7 @@ page = option_menu(
 
 # ── Home page ────────────────────────────────────────────────────────────────
 if page == "Home":
-    st.title("🏠 Kia Orana! Welcome")
+    st.title("🏠 Kia Orana! Wellcome")
     st.write(
         "Welcome to the CIM NLP platform. "
         "Use the menu above to navigate between tools."
