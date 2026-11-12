@@ -66,37 +66,53 @@ elif page == "Transcription":
 
     tab_upload, tab_gdrive, tab_record = st.tabs(["📁 Upload a file", "🔗 Google Drive link", "🎤 Record audio"])
 
-    def submit_audio(file_name: str, file_content: bytes, user_email: str):
-        def send_request():
-            try:
-                requests.post(
-                    st.secrets["ASR_URL"],
-                    files={"file": (file_name, file_content, "audio/wav")},
-                    data={"email": user_email},
-                    timeout=3600,
-                )
-            except Exception:
-                pass
+    # ── DEBUG MODE ───────────────────────────────────────────────────────────
+    # Requests are sent synchronously and every result/error is shown on screen.
+    # Revert to the threaded version once the problem is found.
+    DEBUG_TIMEOUT = 60  # seconds to wait for the server before giving up
 
-        thread = threading.Thread(target=send_request, daemon=True)
-        thread.start()
+    with st.expander("🛠️ Debug info", expanded=True):
+        try:
+            from urllib.parse import urlparse
+            _parsed = urlparse(st.secrets["ASR_URL"])
+            # Show only scheme + host so the full URL isn't exposed on the page
+            st.write(f"ASR_URL is set → `{_parsed.scheme}://{_parsed.netloc}/…`")
+        except Exception as e:
+            st.error(f"ASR_URL could not be read from secrets: {type(e).__name__}: {e}")
+
+    def show_response(response):
+        st.write(f"**HTTP status:** {response.status_code} {response.reason}")
+        st.write(f"**Content-Type:** {response.headers.get('Content-Type', '(none)')}")
+        st.write("**Response body (first 2000 chars):**")
+        st.code(response.text[:2000] or "(empty)", language=None)
+
+    def debug_post(**kwargs):
+        try:
+            with st.spinner("Contacting ASR server…"):
+                response = requests.post(st.secrets["ASR_URL"], timeout=DEBUG_TIMEOUT, **kwargs)
+            show_response(response)
+            return response.ok
+        except requests.exceptions.Timeout:
+            st.warning(
+                f"No reply within {DEBUG_TIMEOUT} s. If the server only replies after it "
+                "finishes transcribing, this may be normal; check whether the emails arrive."
+            )
+        except requests.exceptions.ConnectionError as e:
+            st.error(f"Connection error (server unreachable or URL wrong): {e}")
+        except Exception as e:
+            st.error(f"Unexpected error: {type(e).__name__}: {e}")
+        return False
+
+    def submit_audio(file_name: str, file_content: bytes, user_email: str):
+        st.write(f"Sending **{file_name}** ({len(file_content):,} bytes) as multipart form data…")
+        return debug_post(
+            files={"file": (file_name, file_content, "audio/wav")},
+            data={"email": user_email},
+        )
 
     def submit_gdrive(gdrive_url: str, user_email: str):
-        def send_request():
-            try:
-                requests.post(
-                    st.secrets["ASR_URL"],
-                    json={
-                        "gdrive_url": gdrive_url,
-                        "email": user_email,
-                    },
-                    timeout=3600,
-                )
-            except Exception:
-                pass
-
-        thread = threading.Thread(target=send_request, daemon=True)
-        thread.start()
+        st.write("Sending Google Drive link as JSON…")
+        return debug_post(json={"gdrive_url": gdrive_url, "email": user_email})
 
     with tab_upload:
         st.info("⚠️ Maximum file size: **10 MB**. For larger files, use the **Google Drive link** tab.")
@@ -109,8 +125,8 @@ elif page == "Transcription":
                 st.error("Please upload a WAV file.")
             else:
                 file_content = uploaded.read()
-                submit_audio(uploaded.name, file_content, email)
-                st.success(
+                if submit_audio(uploaded.name, file_content, email):
+                    st.success(
                     "✅ Your file has been submitted! You will receive an email "
                     "when processing begins, and another when your transcription "
                     "is ready."
@@ -135,8 +151,8 @@ elif page == "Transcription":
             elif "drive.google.com" not in gdrive_link and "docs.google.com" not in gdrive_link:
                 st.error("Please enter a valid Google Drive link.")
             else:
-                submit_gdrive(gdrive_link, email)
-                st.success(
+                if submit_gdrive(gdrive_link, email):
+                    st.success(
                     "✅ Your Google Drive link has been submitted! You will receive an email "
                     "when processing begins, and another when your transcription "
                     "is ready."
@@ -152,8 +168,8 @@ elif page == "Transcription":
                 st.error("Please make a recording first.")
             else:
                 file_content = recording.read()
-                submit_audio("recording.wav", file_content, email)
-                st.success(
+                if submit_audio("recording.wav", file_content, email):
+                    st.success(
                     "✅ Your recording has been submitted! You will receive an "
                     "email when processing begins, and another when your "
                     "transcription is ready."
