@@ -1,5 +1,6 @@
 import io
 import json
+import inspect
 import time
 import wave
 import base64
@@ -194,7 +195,12 @@ elif page == "Transcription":
     with tab_upload:
         st.info(f"⚠️ Maximum file size: **{MAX_UPLOAD_MB} MB**. "
                 "For larger files, use the **Google Drive link** tab.")
-        uploaded = st.file_uploader("Choose an audio file", type=["wav"])
+        # Only one file per submission. Newer Streamlit versions accept a per-widget size
+        # limit; older ones fall back to server.maxUploadSize in .streamlit/config.toml.
+        uploader_kwargs = {"type": ["wav"], "accept_multiple_files": False}
+        if "max_upload_size" in inspect.signature(st.file_uploader).parameters:
+            uploader_kwargs["max_upload_size"] = MAX_UPLOAD_MB
+        uploaded = st.file_uploader("Choose an audio file", **uploader_kwargs)
 
         if st.button("Transcribe uploaded file", key="btn_upload"):
             if not email:
