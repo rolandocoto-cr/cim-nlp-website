@@ -1,7 +1,13 @@
+import io
+import json
+import time
+import wave
+import base64
+import threading
+
 import requests
 import streamlit as st
-import threading
-import base64
+from urllib3.filepost import encode_multipart_formdata
 from streamlit_option_menu import option_menu
 
 st.set_page_config(page_title="Cook Islands Māori NLP", initial_sidebar_state="collapsed")
@@ -50,7 +56,7 @@ page = option_menu(
 
 # ── Home page ────────────────────────────────────────────────────────────────
 if page == "Home":
-    st.title("🏠 Kia Orana! Wellcome")
+    st.title("🏠 Kia Orana! Welcome!")
     st.write(
         "Welcome to the CIM NLP platform. "
         "Use the menu above to navigate between tools."
@@ -62,60 +68,132 @@ elif page == "Transcription":
     st.write("Upload an audio file, share a Google Drive link, or record directly in your browser. "
              "You'll receive the transcription by email.")
 
+    MAX_UPLOAD_MB = 25            # keep in sync with server.maxUploadSize in .streamlit/config.toml
+    MAX_RECORDING_SECONDS = 60
+    UPLOAD_MAX_WAIT = 15 * 60     # give up if an upload hasn't finished after 15 minutes
+    SERVER_GRACE_SECONDS = 5      # after upload, wait briefly in case the server rejects it right away
+
     email = st.text_input("Your email address")
 
     tab_upload, tab_gdrive, tab_record = st.tabs(["📁 Upload a file", "🔗 Google Drive link", "🎤 Record audio"])
 
-    # ── DEBUG MODE ───────────────────────────────────────────────────────────
-    # Requests are sent synchronously and every result/error is shown on screen.
-    # Revert to the threaded version once the problem is found.
-    DEBUG_TIMEOUT = 60  # seconds to wait for the server before giving up
+    # ── DEBUG INFO (uncomment to check that ASR_URL is readable from secrets) ──
+    # with st.expander("🛠️ Debug info", expanded=True):
+    #     try:
+    #         from urllib.parse import urlparse
+    #         _parsed = urlparse(st.secrets["ASR_URL"])
+    #         st.write(f"ASR_URL is set → `{_parsed.scheme}://{_parsed.netloc}/…`")
+    #     except Exception as e:
+    #         st.error(f"ASR_URL could not be read from secrets: {type(e).__name__}: {e}")
 
-    with st.expander("🛠️ Debug info", expanded=True):
+    class UploadTracker:
+        """File-like wrapper around the request body that counts how many bytes have been sent."""
+        def __init__(self, body: bytes):
+            self._buf = io.BytesIO(body)
+            self.total = len(body)
+            self.sent = 0
+            self.done = threading.Event()
+
+        def read(self, size=-1):
+            chunk = self._buf.read(size)
+            self.sent += len(chunk)
+            if self.sent >= self.total:
+                self.done.set()
+            return chunk
+
+        def __len__(self):
+            return self.total
+
+    def send_to_asr(body: bytes, content_type: str, what: str) -> bool:
+        """
+        Send the request in a background thread (the server only replies after the
+        transcription is finished), show upload progress, and return True once the
+        upload has completed and the server hasn't rejected it.
+        """
         try:
-            from urllib.parse import urlparse
-            _parsed = urlparse(st.secrets["ASR_URL"])
-            # Show only scheme + host so the full URL isn't exposed on the page
-            st.write(f"ASR_URL is set → `{_parsed.scheme}://{_parsed.netloc}/…`")
-        except Exception as e:
-            st.error(f"ASR_URL could not be read from secrets: {type(e).__name__}: {e}")
+            asr_url = st.secrets["ASR_URL"]
+        except Exception:
+            st.error("The transcription service is not configured (ASR_URL missing). "
+                     "Please contact the site administrator.")
+            return False
 
-    def show_response(response):
-        st.write(f"**HTTP status:** {response.status_code} {response.reason}")
-        st.write(f"**Content-Type:** {response.headers.get('Content-Type', '(none)')}")
-        st.write("**Response body (first 2000 chars):**")
-        st.code(response.text[:2000] or "(empty)", language=None)
+        tracker = UploadTracker(body)
+        result = {"status": None, "body": "", "error": None}
+        finished = threading.Event()
 
-    def debug_post(**kwargs):
+        def worker():
+            try:
+                r = requests.post(
+                    asr_url,
+                    data=tracker,
+                    headers={"Content-Type": content_type},
+                    timeout=(30, 3600),
+                )
+                result["status"] = r.status_code
+                result["body"] = r.text[:500]
+            except Exception as e:
+                result["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                finished.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        total_mb = tracker.total / 1_000_000
+        bar = st.progress(0.0, text=f"Sending {what}…")
+        deadline = time.time() + UPLOAD_MAX_WAIT
+        while not tracker.done.is_set() and not finished.is_set():
+            if time.time() > deadline:
+                bar.empty()
+                st.error("The upload is taking too long. Please check your connection and try again.")
+                return False
+            frac = tracker.sent / tracker.total if tracker.total else 1.0
+            bar.progress(min(frac, 1.0),
+                         text=f"Sending {what}… {tracker.sent / 1_000_000:.1f} of {total_mb:.1f} MB")
+            time.sleep(0.25)
+
+        bar.progress(1.0, text=f"Upload complete ({total_mb:.1f} MB). Checking with the server…")
+        finished.wait(timeout=SERVER_GRACE_SECONDS)
+        bar.empty()
+
+        if result["error"]:
+            st.error(f"Could not reach the transcription service. Please try again later.\n\n"
+                     f"Details: {result['error']}")
+            return False
+        if result["status"] is not None and not (200 <= result["status"] < 300):
+            st.error(f"The transcription service rejected the request (HTTP {result['status']}).\n\n"
+                     f"Details: {result['body'] or '(no details)'}")
+            return False
+        return True
+
+    def submit_audio(file_name: str, file_content: bytes, user_email: str) -> bool:
+        body, content_type = encode_multipart_formdata({
+            "email": user_email,
+            "file": (file_name, file_content, "audio/wav"),
+        })
+        return send_to_asr(body, content_type, "your audio")
+
+    def submit_gdrive(gdrive_url: str, user_email: str) -> bool:
+        body = json.dumps({"gdrive_url": gdrive_url, "email": user_email}).encode("utf-8")
+        return send_to_asr(body, "application/json", "your Google Drive link")
+
+    def wav_duration_seconds(data: bytes):
+        """Length of a WAV file in seconds, or None if it can't be read."""
         try:
-            with st.spinner("Contacting ASR server…"):
-                response = requests.post(st.secrets["ASR_URL"], timeout=DEBUG_TIMEOUT, **kwargs)
-            show_response(response)
-            return response.ok
-        except requests.exceptions.Timeout:
-            st.warning(
-                f"No reply within {DEBUG_TIMEOUT} s. If the server only replies after it "
-                "finishes transcribing, this may be normal; check whether the emails arrive."
-            )
-        except requests.exceptions.ConnectionError as e:
-            st.error(f"Connection error (server unreachable or URL wrong): {e}")
-        except Exception as e:
-            st.error(f"Unexpected error: {type(e).__name__}: {e}")
-        return False
+            with wave.open(io.BytesIO(data)) as w:
+                return w.getnframes() / float(w.getframerate())
+        except Exception:
+            return None
 
-    def submit_audio(file_name: str, file_content: bytes, user_email: str):
-        st.write(f"Sending **{file_name}** ({len(file_content):,} bytes) as multipart form data…")
-        return debug_post(
-            files={"file": (file_name, file_content, "audio/wav")},
-            data={"email": user_email},
+    def show_started_message():
+        st.success(
+            "✅ Upload complete. The process has begun, please monitor your email. "
+            "You will receive one email when processing starts and another "
+            "when your transcription is ready (check your spam folder too)."
         )
 
-    def submit_gdrive(gdrive_url: str, user_email: str):
-        st.write("Sending Google Drive link as JSON…")
-        return debug_post(json={"gdrive_url": gdrive_url, "email": user_email})
-
     with tab_upload:
-        st.info("⚠️ Maximum file size: **10 MB**. For larger files, use the **Google Drive link** tab.")
+        st.info(f"⚠️ Maximum file size: **{MAX_UPLOAD_MB} MB**. "
+                "For larger files, use the **Google Drive link** tab.")
         uploaded = st.file_uploader("Choose an audio file", type=["wav"])
 
         if st.button("Transcribe uploaded file", key="btn_upload"):
@@ -123,14 +201,12 @@ elif page == "Transcription":
                 st.error("Please enter your email address.")
             elif not uploaded:
                 st.error("Please upload a WAV file.")
+            elif uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+                st.error(f"This file is {uploaded.size / (1024 * 1024):.1f} MB, which is over the "
+                         f"{MAX_UPLOAD_MB} MB limit. Please use the **Google Drive link** tab instead.")
             else:
-                file_content = uploaded.read()
-                if submit_audio(uploaded.name, file_content, email):
-                    st.success(
-                    "✅ Your file has been submitted! You will receive an email "
-                    "when processing begins, and another when your transcription "
-                    "is ready."
-                )
+                if submit_audio(uploaded.name, uploaded.getvalue(), email):
+                    show_started_message()
 
     with tab_gdrive:
         st.write("Share your audio file via Google Drive. Make sure the file is set to "
@@ -152,28 +228,36 @@ elif page == "Transcription":
                 st.error("Please enter a valid Google Drive link.")
             else:
                 if submit_gdrive(gdrive_link, email):
-                    st.success(
-                    "✅ Your Google Drive link has been submitted! You will receive an email "
-                    "when processing begins, and another when your transcription "
-                    "is ready."
-                )
+                    show_started_message()
 
     with tab_record:
+        st.info(f"⏱️ Recordings are limited to **{MAX_RECORDING_SECONDS} seconds**. "
+                "Longer recordings will not be sent. For longer audio, use the "
+                "**Upload a file** or **Google Drive link** tab.")
         recording = st.audio_input("Click the microphone to start recording")
+
+        duration = None
+        if recording:
+            file_content = recording.getvalue()
+            duration = wav_duration_seconds(file_content)
+            if duration is not None:
+                if duration > MAX_RECORDING_SECONDS:
+                    st.warning(f"Your recording is {duration:.0f} seconds long, which is over the "
+                               f"{MAX_RECORDING_SECONDS}-second limit. Please record a shorter clip.")
+                else:
+                    st.caption(f"Recording length: {duration:.0f} seconds")
 
         if st.button("Transcribe recording", key="btn_record"):
             if not email:
                 st.error("Please enter your email address.")
             elif not recording:
                 st.error("Please make a recording first.")
+            elif duration is not None and duration > MAX_RECORDING_SECONDS:
+                st.error(f"Recordings must be {MAX_RECORDING_SECONDS} seconds or shorter. "
+                         "Please record again.")
             else:
-                file_content = recording.read()
                 if submit_audio("recording.wav", file_content, email):
-                    st.success(
-                    "✅ Your recording has been submitted! You will receive an "
-                    "email when processing begins, and another when your "
-                    "transcription is ready."
-                )
+                    show_started_message()
 
 # ── Voice Generation page ───────────────────────────────────────────────────
 elif page == "Voice Generation":
